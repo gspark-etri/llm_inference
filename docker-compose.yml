@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model meta-llama/Llama-3.1-8B-Instruct
+      --dtype auto
+      --max-model-len 8192
+      --gpu-memory-utilization 0.9
+      --port 8000
+      --trust-remote-code
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
+    ports:
+      - "8000:8000"
+    deploy: {}
+    gpus: all
+    ipc: host
+    volumes:
+      - ./hf-cache:/root/.cache/huggingface
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+    privileged: true
+    gpus: all
+    ports:
+      - "9400:9400"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+    depends_on:
+      - vllm
+      - dcgm-exporter
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning/datasources/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    restart: unless-stopped
+    depends_on:
+      - prometheus
