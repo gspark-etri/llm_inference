@@ -215,14 +215,19 @@ def main():
     rx_rate_curr = 0.0
     # Histories for sparklines
     plot_capacity = max(6, int(args.plot_window / max(args.log_every, 1e-6)) * max(1, min(2, args.plot_rows)))
-    qps_hist = deque(maxlen=plot_capacity)
-    tx_hist = deque(maxlen=plot_capacity)
-    rx_hist = deque(maxlen=plot_capacity)
-    lat_hist = deque(maxlen=plot_capacity)  # store per-interval p95 or mean if desired
-    lat_p95_hist = deque(maxlen=plot_capacity)
-    lat_p99_hist = deque(maxlen=plot_capacity)
-    # Accumulator for current interval latencies
-    latencies_sample = []
+    # histories (throughput & latency percentiles)
+    rps_hist = deque(maxlen=plot_capacity)          # completed requests per sec
+    in_tps_hist = deque(maxlen=plot_capacity)       # input tokens per sec
+    out_tps_hist = deque(maxlen=plot_capacity)      # output tokens per sec
+    ttft_p95_hist = deque(maxlen=plot_capacity)     # ms
+    tpot_p95_hist = deque(maxlen=plot_capacity)     # ms/token
+    # Accumulators for current sample window
+    sample_completed = 0
+    sample_in_tokens = 0
+    sample_out_tokens = 0
+    sample_ttft = []
+    sample_tpot = []
+    latencies_sample = []  # end-to-end latency; kept for reference
     sent_lock = threading.Lock()
     start_wall = time.time()
 
@@ -240,12 +245,38 @@ def main():
         req_rx = 0
         start_req = time.time()
         latency_ms = None
+        ttft_ms = None
+        out_tokens = 0
         try:
             with requests.post(args.url, headers=head, json=payload, stream=True, timeout=args.timeout) as resp:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if not chunk:
+                for raw in resp.iter_lines(decode_unicode=False):
+                    if raw is None:
                         continue
-                    req_rx += len(chunk)
+                    # raw is bytes (since decode_unicode=False)
+                    req_rx += len(raw)
+                    if not raw:
+                        continue
+                    line = raw.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == b"[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data.decode("utf-8"))
+                        ch = obj.get("choices", [{}])
+                        if ch:
+                            delta = ch[0].get("delta", {})
+                            content = delta.get("content", "") if isinstance(delta, dict) else ""
+                        else:
+                            content = ""
+                    except Exception:
+                        content = ""
+                    # count tokens approximately per non-empty content
+                    if content:
+                        out_tokens += 1
+                        if ttft_ms is None:
+                            ttft_ms = (time.time() - start_req) * 1000.0
                 if resp.status_code >= 400: ok = False
                 latency_ms = (time.time() - start_req) * 1000.0
         except Exception:
@@ -253,7 +284,11 @@ def main():
         finally:
             if latency_ms is None:
                 latency_ms = (time.time() - start_req) * 1000.0
-            done_q.put((ok, itok, otok, req_tx, req_rx, latency_ms))
+            # TPOT(ms/token)
+            tpot_ms = None
+            if ttft_ms is not None and out_tokens > 0:
+                tpot_ms = max(0.0, (latency_ms - ttft_ms) / max(1, out_tokens))
+            done_q.put((ok, itok, out_tokens, req_tx, req_rx, latency_ms, ttft_ms, tpot_ms))
             sem.release()
 
     # ----- UI -----
@@ -439,46 +474,43 @@ def main():
                 else:
                     header_tbl.add_row(f"curr: {right_text}")
                 # Chart: y-labels + bars (2 columns only to avoid horizontal overflow)
-                chart_tbl = Table.grid(expand=False)
+                chart_tbl = Table.grid(expand=True)
                 chart_tbl.add_column(no_wrap=True)
                 chart_tbl.add_column(no_wrap=True)
                 for i in range(height):
                     chart_tbl.add_row(y_lines[i], bars[i])
                 # Stack header + chart vertically
-                container = Table.grid(expand=False)
+                container = Table.grid(expand=True)
                 container.add_column(no_wrap=True)
                 container.add_row(header_tbl)
                 container.add_row(chart_tbl)
                 return Panel(container, title=title, border_style=border_style, padding=(0,1))
-
-            # compact right labels of fixed width
-            right_w = max(6, num_w)
-            qps_right = format_qps_compact(qps_curr, right_w)
-            tx_right  = format_rate_compact(tx_rate_curr, right_w)
-            rx_right  = format_rate_compact(rx_rate_curr, right_w)
-            lat95_right = format_ms(lat_p95_hist[-1]) if len(lat_p95_hist) else "n/a"
-            lat99_right = format_ms(lat_p99_hist[-1]) if len(lat_p99_hist) else "n/a"
-
-            qps_panel = make_metric_panel("QPS (curr)", qps_hist, fmt_qps, qps_right, "cyan")
-            tx_panel  = make_metric_panel("TX rate (curr)", tx_hist, fmt_rate, tx_right, "magenta")
-            rx_panel  = make_metric_panel("RX rate (curr)", rx_hist, fmt_rate, rx_right, "magenta")
-            lat95_panel = make_metric_panel("Latency p95", lat_p95_hist, fmt_ms, lat95_right, "yellow")
-            lat99_panel = make_metric_panel("Latency p99", lat_p99_hist, fmt_ms, lat99_right, "yellow")
+            # Panels with inline right labels
+            rps_panel  = make_metric_panel(
+                "Req Throughput", rps_hist, fmt_qps,
+                f"{(rps_hist[-1] if rps_hist else 0):.2f} /s", "cyan")
+            in_panel   = make_metric_panel(
+                "Input Token TPS", in_tps_hist, lambda v: f"{v:,.0f}",
+                f"{(in_tps_hist[-1] if in_tps_hist else 0):.0f} t/s", "magenta")
+            out_panel  = make_metric_panel(
+                "Output Token TPS", out_tps_hist, lambda v: f"{v:,.0f}",
+                f"{(out_tps_hist[-1] if out_tps_hist else 0):.0f} t/s", "magenta")
+            ttft_panel = make_metric_panel(
+                "TTFT p95", ttft_p95_hist, fmt_ms,
+                (format_ms(ttft_p95_hist[-1]) if len(ttft_p95_hist) else "n/a"), "yellow")
+            tpot_panel = make_metric_panel(
+                "TPOT p95", tpot_p95_hist, lambda v: f"{v:,.1f} ms",
+                f"{(tpot_p95_hist[-1] if tpot_p95_hist else 0):.1f} ms", "yellow")
             use_panels = True
         else:
-            qps_num = fixed_width(f"{qps_curr:,.2f}", num_w)
-            tx_num  = fixed_width(f"{format_rate(tx_rate_curr)}", num_w)
-            rx_num  = fixed_width(f"{format_rate(rx_rate_curr)}", num_w)
-            qps_color = color_for(qps_curr, qps_hist)
-            tx_color  = color_for(tx_rate_curr, tx_hist)
-            rx_color  = color_for(rx_rate_curr, rx_hist)
-            lat95_color = color_for(lat_p95_hist[-1] if len(lat_p95_hist) else 0, lat_p95_hist)
-            lat99_color = color_for(lat_p99_hist[-1] if len(lat_p99_hist) else 0, lat_p99_hist)
-            qps_cell = f"[{qps_color}]{simple_spark(qps_hist, spark_w)}[/] {qps_num}"
-            tx_cell  = f"[{tx_color}]{simple_spark(tx_hist,  spark_w)}[/] {tx_num}"
-            rx_cell  = f"[{rx_color}]{simple_spark(rx_hist,  spark_w)}[/] {rx_num}"
-            lat95_cell = f"[{lat95_color}]{simple_spark(lat_p95_hist, spark_w)}[/] {fixed_width(format_ms(lat_p95_hist[-1]) if len(lat_p95_hist) else 'n/a', num_w)}"
-            lat99_cell = f"[{lat99_color}]{simple_spark(lat_p99_hist, spark_w)}[/] {fixed_width(format_ms(lat_p99_hist[-1]) if len(lat_p99_hist) else 'n/a', num_w)}"
+            # fallback simple lines
+            ttft_right = (format_ms(ttft_p95_hist[-1]) if len(ttft_p95_hist) else "n/a")
+            tpot_right = f"{(tpot_p95_hist[-1] if tpot_p95_hist else 0):.1f} ms"
+            rps_cell = f"{simple_spark(rps_hist, spark_w)} {fixed_width(f'{(rps_hist[-1] if rps_hist else 0):.2f}', num_w)}"
+            in_cell  = f"{simple_spark(in_tps_hist, spark_w)} {fixed_width(f'{(in_tps_hist[-1] if in_tps_hist else 0):.0f}', num_w)}"
+            out_cell = f"{simple_spark(out_tps_hist, spark_w)} {fixed_width(f'{(out_tps_hist[-1] if out_tps_hist else 0):.0f}', num_w)}"
+            ttft_cell= f"{simple_spark(ttft_p95_hist, spark_w)} {fixed_width(ttft_right, num_w)}"
+            tpot_cell= f"{simple_spark(tpot_p95_hist, spark_w)} {fixed_width(tpot_right, num_w)}"
             use_panels = False
         # Build a dedicated visualization panel separate from the metrics rows
         vis_tbl = Table.grid(expand=True)
@@ -486,19 +518,21 @@ def main():
         vis_tbl.add_column(ratio=1)
         vis_tbl.add_column(ratio=1)
         if use_panels:
-            qps_render = qps_panel
-            tx_render  = tx_panel
-            rx_render  = rx_panel
-            lat95_render = lat95_panel
-            lat99_render = lat99_panel
+            r1_a = rps_panel
+            r1_b = in_panel
+            r1_c = out_panel
+            r2_a = ttft_panel
+            r2_b = tpot_panel
+            r2_c = Panel("", border_style="dim")
         else:
-            qps_render = Panel(qps_cell, title="QPS (curr)", border_style="cyan", padding=(0,1))
-            tx_render  = Panel(tx_cell,  title="TX rate (curr)", border_style="magenta", padding=(0,1))
-            rx_render  = Panel(rx_cell,  title="RX rate (curr)", border_style="magenta", padding=(0,1))
-            lat95_render = Panel(lat95_cell, title="Latency p95", border_style="yellow", padding=(0,1))
-            lat99_render = Panel(lat99_cell, title="Latency p99", border_style="yellow", padding=(0,1))
-        vis_tbl.add_row(qps_render, tx_render, rx_render)
-        vis_tbl.add_row(lat95_render, lat99_render, Panel("", border_style="dim"))
+            r1_a = Panel(rps_cell, title="Req Throughput", border_style="cyan", padding=(0,1))
+            r1_b = Panel(in_cell,  title="Input Token TPS", border_style="magenta", padding=(0,1))
+            r1_c = Panel(out_cell, title="Output Token TPS", border_style="magenta", padding=(0,1))
+            r2_a = Panel(ttft_cell, title="TTFT p95", border_style="yellow", padding=(0,1))
+            r2_b = Panel(tpot_cell, title="TPOT p95", border_style="yellow", padding=(0,1))
+            r2_c = Panel("", border_style="dim")
+        vis_tbl.add_row(r1_a, r1_b, r1_c)
+        vis_tbl.add_row(r2_a, r2_b, r2_c)
         tbl.add_row("Visualize", Panel(vis_tbl, border_style="white", padding=(0,1)))
         tbl.add_row("TX rate (avg)", format_rate(tx_total / elapsed))
         tbl.add_row("RX rate (avg)", format_rate(rx_total / elapsed))
@@ -545,10 +579,10 @@ def main():
     sent_at_last = 0
 
     def drain_done(non_blocking=True):
-        nonlocal sent, err, sum_in, sum_out, tx_total, rx_total, tx_since_sample, rx_since_sample
+        nonlocal sent, err, sum_in, sum_out, tx_total, rx_total, tx_since_sample, rx_since_sample, sample_completed, sample_in_tokens, sample_out_tokens
         while True:
             try:
-                ok, i, o, btx, brx, l_ms = done_q.get_nowait() if non_blocking else done_q.get()
+                ok, i, o, btx, brx, l_ms, ttft_ms, tpot_ms = done_q.get_nowait() if non_blocking else done_q.get()
             except queue.Empty:
                 break
             with sent_lock:
@@ -560,6 +594,13 @@ def main():
                 tx_since_sample += btx
                 rx_since_sample += brx
                 latencies_sample.append(l_ms)
+                sample_completed += 1
+                sample_in_tokens += int(i)
+                sample_out_tokens += int(o)
+                if ttft_ms is not None:
+                    sample_ttft.append(ttft_ms)
+                if tpot_ms is not None:
+                    sample_tpot.append(tpot_ms)
                 if not ok: err += 1
             # progress handled by integrated table
 
@@ -587,18 +628,19 @@ def main():
                     if time.time() >= next_sample:
                         tx_rate_curr = tx_since_sample / max(1e-6, args.sample_interval)
                         rx_rate_curr = rx_since_sample / max(1e-6, args.sample_interval)
-                        p95 = percentile(latencies_sample, 0.95) if latencies_sample else None
-                        p99 = percentile(latencies_sample, 0.99) if latencies_sample else None
                         if not args.no_plot:
-                            qps_hist.append(qps_curr)
-                            tx_hist.append(tx_rate_curr)
-                            rx_hist.append(rx_rate_curr)
-                            if p95 is not None:
-                                lat_p95_hist.append(p95)
-                            if p99 is not None:
-                                lat_p99_hist.append(p99)
+                            rps_hist.append(sample_completed / max(1e-6, args.sample_interval))
+                            in_tps_hist.append(sample_in_tokens / max(1e-6, args.sample_interval))
+                            out_tps_hist.append(sample_out_tokens / max(1e-6, args.sample_interval))
+                            ttft_p95_hist.append(percentile(sample_ttft, 0.95) or 0.0)
+                            tpot_p95_hist.append(percentile(sample_tpot, 0.95) or 0.0)
                         tx_since_sample = 0
                         rx_since_sample = 0
+                        sample_completed = 0
+                        sample_in_tokens = 0
+                        sample_out_tokens = 0
+                        sample_ttft.clear()
+                        sample_tpot.clear()
                         latencies_sample.clear()
                         next_sample = time.time() + args.sample_interval
                 live.update(render_table())
@@ -629,18 +671,19 @@ def main():
                     if time.time() >= next_sample:
                         tx_rate_curr = tx_since_sample / max(1e-6, args.sample_interval)
                         rx_rate_curr = rx_since_sample / max(1e-6, args.sample_interval)
-                        p95 = percentile(latencies_sample, 0.95) if latencies_sample else None
-                        p99 = percentile(latencies_sample, 0.99) if latencies_sample else None
                         if not args.no_plot:
-                            qps_hist.append(qps_curr)
-                            tx_hist.append(tx_rate_curr)
-                            rx_hist.append(rx_rate_curr)
-                            if p95 is not None:
-                                lat_p95_hist.append(p95)
-                            if p99 is not None:
-                                lat_p99_hist.append(p99)
+                            rps_hist.append(sample_completed / max(1e-6, args.sample_interval))
+                            in_tps_hist.append(sample_in_tokens / max(1e-6, args.sample_interval))
+                            out_tps_hist.append(sample_out_tokens / max(1e-6, args.sample_interval))
+                            ttft_p95_hist.append(percentile(sample_ttft, 0.95) or 0.0)
+                            tpot_p95_hist.append(percentile(sample_tpot, 0.95) or 0.0)
                         tx_since_sample = 0
                         rx_since_sample = 0
+                        sample_completed = 0
+                        sample_in_tokens = 0
+                        sample_out_tokens = 0
+                        sample_ttft.clear()
+                        sample_tpot.clear()
                         latencies_sample.clear()
                         next_sample = time.time() + args.sample_interval
                 live.update(render_table())

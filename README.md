@@ -55,11 +55,41 @@ Dashboard flags (visualization):
 - `--y-width`: Fixed width for left Y-axis labels (right-aligned); prevents layout shift
 
 Displayed metrics:
-- QPS (curr): requests per second over the last interval
-- TX/RX rate (curr): application-layer bytes per second. Each column is color-coded by intensity (green/yellow/red)
-- Latency p95 / p99: per-interval percentile latencies (ms)
-- Progress: integrated progress bar with ETA
+- Request Throughput (RPS): current over the last sample window
+- Input Token TPS / Output Token TPS
+- TTFT p95 (ms) and TPOT p95 (ms/token)
+- Net TX/RX (totals) and TX/RX rate (avg)
+- Progress with ETA
 
 Notes on visualization:
 - Charts render with braille (8-dot) resolution to avoid gaps and support smooth vertical scaling
 - Graph area, Y-axis labels, and numeric text are separate columns to prevent text from shifting the chart
+
+## TTFT vs TPOT
+
+- TTFT (Time To First Token): includes queuing, prompt prefill, KV cache setup, first-token compute/sampling, and the first streamed byte. Typically larger than TPOT.
+- TPOT (Time Per Output Token): amortized decode step time per token after the first token. Reported as ms/token.
+
+In most deployments TTFT > TPOT. TPOT can be higher when sequences are very long, batches are large, or streaming is buffered.
+
+## RX accounting (streamed bytes)
+
+- RX counts the application-layer bytes of SSE lines returned by the server (sum of raw line lengths).
+- If the server batches tokens into fewer SSE events or buffers output, RX may appear low and then jump.
+- Ensure the endpoint streams Server-Sent Events with lines starting with `data:`.
+
+## Quick sanity test
+
+```bash
+uv run python test/replay_vllm_azure2024.py \
+  --csv hf-cache/AzureLLMInferenceTrace_conv_1week.csv \
+  --url http://localhost:8000/v1/chat/completions \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --limit 10000 --speedup 10 --concurrency 16
+```
+
+## Limitations
+
+- `--no-cache` mode is not implemented for live replay; use the default cached path.
+- Token counting is approximate when the server aggregates multiple tokens per SSE line.
+- RX/TX are application-layer sizes (JSON request, SSE response), not TCP-level bytes.
