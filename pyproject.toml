@@ -1,0 +1,11 @@
+[project]
+name = "llm-stack-tools"
+version = "0.1.0"
+dependencies = [
+    "pandas",
+    "numpy",
+    "requests",
+    "pyarrow",
+    "tqdm",
+    "rich",
+]

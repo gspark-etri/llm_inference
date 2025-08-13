@@ -1,2 +1,6 @@
 .env
-.hf-cache/*
+hf-cache/*
+*.csv
+uv.lock
+.venv/*
+.llm-cache/*
