@@ -146,7 +146,8 @@ def main():
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--log-every", type=float, default=2.0)
-    ap.add_argument("--plot-window", type=float, default=30.0, help="스파크라인 윈도우(초)")
+    ap.add_argument("--sample-interval", type=float, default=5.0, help="통계 샘플 집계 주기(초). 기본값은 --log-every")
+    ap.add_argument("--plot-window", type=float, default=60.0, help="스파크라인 윈도우(초)")
     ap.add_argument("--no-plot", action="store_true", help="스파크라인 비활성화")
     ap.add_argument("--plot-rows", type=int, default=2, help="스파크라인 라인 수(1 또는 2)")
     ap.add_argument("--bar-width", type=int, default=36, help="진행 바 너비(문자 단위)")
@@ -160,6 +161,8 @@ def main():
     ap.add_argument("--sort", dest="assume_sorted", action="store_false", help="정렬 보장 없으면 켜기(느림)")
     ap.add_argument("--limit", type=int, default=None, help="최대 N행만 재생(샘플 테스트용)")
     args = ap.parse_args()
+    if args.sample_interval is None:
+        args.sample_interval = args.log_every
 
     os.makedirs(args.cache_dir, exist_ok=True)
     base = os.path.basename(args.csv)
@@ -205,8 +208,8 @@ def main():
     # Network stats (application-layer bytes)
     tx_total = 0  # bytes sent (request payloads)
     rx_total = 0  # bytes received (streamed responses)
-    tx_since = 0  # bytes sent since last UI refresh
-    rx_since = 0  # bytes received since last UI refresh
+    tx_since_sample = 0  # bytes sent since last sample window
+    rx_since_sample = 0  # bytes received since last sample window
     qps_curr = 0.0
     tx_rate_curr = 0.0
     rx_rate_curr = 0.0
@@ -219,7 +222,7 @@ def main():
     lat_p95_hist = deque(maxlen=plot_capacity)
     lat_p99_hist = deque(maxlen=plot_capacity)
     # Accumulator for current interval latencies
-    latencies_curr = []
+    latencies_sample = []
     sent_lock = threading.Lock()
     start_wall = time.time()
 
@@ -538,10 +541,11 @@ def main():
     wall0 = time.time()
     next_stat = time.time() + args.log_every
     last_update = time.time()
+    next_sample = time.time() + args.sample_interval
     sent_at_last = 0
 
     def drain_done(non_blocking=True):
-        nonlocal sent, err, sum_in, sum_out, tx_total, rx_total, tx_since, rx_since
+        nonlocal sent, err, sum_in, sum_out, tx_total, rx_total, tx_since_sample, rx_since_sample
         while True:
             try:
                 ok, i, o, btx, brx, l_ms = done_q.get_nowait() if non_blocking else done_q.get()
@@ -553,9 +557,9 @@ def main():
                 sum_out += o
                 tx_total += btx
                 rx_total += brx
-                tx_since += btx
-                rx_since += brx
-                latencies_curr.append(l_ms)
+                tx_since_sample += btx
+                rx_since_sample += brx
+                latencies_sample.append(l_ms)
                 if not ok: err += 1
             # progress handled by integrated table
 
@@ -579,26 +583,29 @@ def main():
                 # Update current rates and histories
                 with sent_lock:
                     qps_curr = (sent - sent_at_last) / interval
-                    tx_rate_curr = tx_since / interval
-                    rx_rate_curr = rx_since / interval
-                    # latency percentiles for current interval
-                    p95 = percentile(latencies_curr, 0.95) if latencies_curr else None
-                    p99 = percentile(latencies_curr, 0.99) if latencies_curr else None
-                if not args.no_plot:
-                    qps_hist.append(qps_curr)
-                    tx_hist.append(tx_rate_curr)
-                    rx_hist.append(rx_rate_curr)
-                    if p95 is not None:
-                        lat_p95_hist.append(p95)
-                    if p99 is not None:
-                        lat_p99_hist.append(p99)
+                    # Only update sample-based metrics when sample window elapses
+                    if time.time() >= next_sample:
+                        tx_rate_curr = tx_since_sample / max(1e-6, args.sample_interval)
+                        rx_rate_curr = rx_since_sample / max(1e-6, args.sample_interval)
+                        p95 = percentile(latencies_sample, 0.95) if latencies_sample else None
+                        p99 = percentile(latencies_sample, 0.99) if latencies_sample else None
+                        if not args.no_plot:
+                            qps_hist.append(qps_curr)
+                            tx_hist.append(tx_rate_curr)
+                            rx_hist.append(rx_rate_curr)
+                            if p95 is not None:
+                                lat_p95_hist.append(p95)
+                            if p99 is not None:
+                                lat_p99_hist.append(p99)
+                        tx_since_sample = 0
+                        rx_since_sample = 0
+                        latencies_sample.clear()
+                        next_sample = time.time() + args.sample_interval
                 live.update(render_table())
                 next_stat = time.time() + args.log_every
                 last_update = now
                 sent_at_last = sent
-                tx_since = 0
-                rx_since = 0
-                latencies_curr.clear()
+                # qps is ticked every log interval; rates/latency per sample interval
 
         # 남은 완료 수집
         while True:
@@ -619,25 +626,28 @@ def main():
                 interval = max(1e-6, now - last_update)
                 with sent_lock:
                     qps_curr = (sent - sent_at_last) / interval
-                    tx_rate_curr = tx_since / interval
-                    rx_rate_curr = rx_since / interval
-                    p95 = percentile(latencies_curr, 0.95) if latencies_curr else None
-                    p99 = percentile(latencies_curr, 0.99) if latencies_curr else None
-                if not args.no_plot:
-                    qps_hist.append(qps_curr)
-                    tx_hist.append(tx_rate_curr)
-                    rx_hist.append(rx_rate_curr)
-                    if p95 is not None:
-                        lat_p95_hist.append(p95)
-                    if p99 is not None:
-                        lat_p99_hist.append(p99)
+                    if time.time() >= next_sample:
+                        tx_rate_curr = tx_since_sample / max(1e-6, args.sample_interval)
+                        rx_rate_curr = rx_since_sample / max(1e-6, args.sample_interval)
+                        p95 = percentile(latencies_sample, 0.95) if latencies_sample else None
+                        p99 = percentile(latencies_sample, 0.99) if latencies_sample else None
+                        if not args.no_plot:
+                            qps_hist.append(qps_curr)
+                            tx_hist.append(tx_rate_curr)
+                            rx_hist.append(rx_rate_curr)
+                            if p95 is not None:
+                                lat_p95_hist.append(p95)
+                            if p99 is not None:
+                                lat_p99_hist.append(p99)
+                        tx_since_sample = 0
+                        rx_since_sample = 0
+                        latencies_sample.clear()
+                        next_sample = time.time() + args.sample_interval
                 live.update(render_table())
                 next_stat = time.time() + args.log_every
                 last_update = now
                 sent_at_last = sent
-                tx_since = 0
-                rx_since = 0
-                latencies_curr.clear()
+                # qps ticked each log interval
             time.sleep(0.05)
 
     console.print("[green]Replay finished.[/]")
