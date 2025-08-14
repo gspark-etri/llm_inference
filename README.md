@@ -4,7 +4,7 @@ One-command setup for monitoring LLM inference (TTFT/TPOT/E2E/TPS) and GPU power
 
 ## Quick start
 ```bash
-git clone <your-repo-url>.git
+git clone https://github.com/gspark-etri/llm_inference.git
 cd llm-stack
 
 cp .env.example .env
